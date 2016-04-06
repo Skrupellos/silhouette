@@ -1,0 +1,163 @@
+#!/usr/bin/python3
+
+# https://github.com/vishnubob/silhouette/blob/master/src/gpgl.py
+# https://ohthehugemanatee.net/2011/07/gpgl-reference-courtesy-of-graphtec/
+# http://ohthehugemanatee.net/uploads/2011/07/GP-GL.pdf
+
+import pyshark
+import sys
+import re
+import pyshark
+
+def foo(rexp, dsc, data):
+	match = re.search('^%s$'%rexp, data.decode('cp1252', 'ignore'))
+	if not match is None:
+		return dsc.format(*match.groups())
+	else:
+		return "ERROR"
+
+def bar(rexp, dsc):
+	return lambda x: foo(rexp, dsc, x)
+
+codes = {
+	## A simple dump of the *.bin files over USB.
+	## (The *.bin files are already starting with FW/PW)
+	## Exclusive to flash mode?
+	b'FW'       : bar('', 'Update: Image or media ?????'),
+	b'PW'       : bar('', 'Update: Firmware'),
+	
+	b'FG'       : bar('', '? Name'),
+	b'FN'       : bar('([01])', 'Orientation??? {} (0: Portrait)'),
+	b'FU'       : bar('([09]+)', 'Track enhancing: length to roll????'),
+	b'SO'       : bar('0', 'Set origin???'),
+	
+	## Last set with "\" (Write Lower Left)
+	b'['        : bar('', '? Lower Left'),
+	
+	## Last set with "Z" (Write Upper Right)
+	b'U'        : bar('', '? Upper Right'),
+	
+	b'!'        : bar('([0-9]+)', 'Speed {}'),
+	b'FX'       : bar('([0-9]+)', 'Preasure {}'),
+	
+	b'FY'       : bar('([01])', 'Track enhancing disabled???? {}'),
+	b'\\'       : bar('([0-9]+),([0-9]+)', 'Write Lower Left X = {} Y = {}'),
+	b'Z'        : bar('([0-9]+),([0-9]+)', 'Write Upper Right: X = {} Y = {}'),
+	
+	## 0: Cut (not observed)
+	## 100,1,32,32,0: perforate (edge), edge does more manual drawing
+	b'L'        : bar('(.*)', 'Line type {}'),
+	
+	b'D'        : bar('(.+)', 'Tool down and move to {} (draw)'),
+	b'M'        : bar('([0-9]+),([0-9]+)', 'Tool up and move to {},{} (move)'),
+	b'BZ'        : bar('.*', 'Bézier curve????'),
+	b'FE'       : bar('([01]),0', 'Overcut: Enble = {} ???'),
+	b'FF'       : bar('([0-9]+),([0-9]+),0', 'Overcut: Begin = {}, End = {} ???'),
+	b'FC'       : bar('(.+)', 'Cutter offset !!!!(p,q[,n][t])'),
+	b'0'        : bar('', 'Status: Ready (idle)'),
+	b'1'        : bar('', 'Status: Moving'),
+	b'2'        : bar('', 'Status: Empty tray'),
+	b'\x1b\x05' : bar('', '? Status'),
+	## Check for bitfield combinations
+	b'\x1b\x00\x00' : bar('', 'Manuel movement: X Stop'),
+	b'\x1b\x00\x01' : bar('', 'Manuel movement: v Down'),
+	b'\x1b\x00\x02' : bar('', 'Manuel movement: ^ Up'),
+	b'\x1b\x00\x04' : bar('', 'Manuel movement: > Right'),
+	b'\x1b\x00\x08' : bar('', 'Manuel movement: < Left'),
+	
+	## === Guessed
+	b'TB51,'    : bar('([0-9]+)', 'Regmarks: Length'),
+	b'TB53,'    : bar('([0-9]+)', 'Regmarks: Thickness'),
+}
+
+
+
+def describe(data):
+	## For a prefix search, start with the most specific (longest) key/prefix.
+	for k in sorted(codes, key=len, reverse=True):
+		if data.startswith(k):
+			return codes[k](data[len(k):])
+	
+	return ''
+
+
+def getPkgs(path):
+	cap = pyshark.FileCapture(path)
+	
+	for p in list(cap):
+		if not 'data' in p:
+			continue
+		
+		if not 'usb_capdata' in p.data.field_names:
+			continue
+		
+		data = p.data.usb_capdata.binary_value.split(b'\x03')
+		
+		incomplete = False
+		if data[-1] == b'':
+			data = data[:-1]
+		elif data[0][0] != 0x1b or len(data) != 1:
+			incomplete = True
+		
+		for d in data:
+			yield {
+				'ts': float(p.sniff_timestamp),
+				'out': str(p['USB'].endpoint_number_direction) == '1',
+				'data': d,
+				'incomplete': incomplete,
+			}
+
+
+#showPing = 0  ## Never show status/ping commands
+showPing = 1  ## Show only status status changes (and no requests for them)
+#showPing = 2  ## Show all status/ping commands
+
+oldTs = None
+oldStatus = False
+
+for p in getPkgs(sys.argv[1]):
+	data = p['data']
+	
+	## Ignore some ping/status commands
+	status = -1
+	isPing = False
+	if data in [b'0', b'1', b'2']:
+		status = int(data)
+		isPing = True
+	elif data == b'\x1b\x05':
+		isPing = True
+	
+	if showPing == 0 and isPing or showPing == 1 and isPing and (status == oldStatus or status < 0):
+		continue
+	
+	if status >= 0:
+		oldStatus = status
+	
+	## TS
+	if oldTs is None:
+		deltat = 0.0
+	else:
+		deltat = p['ts'] - oldTs
+	
+	oldTs = p['ts']
+	
+	if deltat > 0.2:
+		sys.stdout.write('\033[1;33m')
+	sys.stdout.write('%10f\033[0m ' % deltat)
+	
+	## Status
+	sys.stdout.write({0: '\033[1mR', 1: '\033[1;32mM', 2: '\033[1;31mE'}[oldStatus])
+	sys.stdout.write('\033[0m ')
+	
+	## Dir
+	sys.stdout.write('\033[1;36m<<< ' if p['out'] else '\033[1;35m>>> ')
+	
+	dsc = describe(p['data'])
+	sys.stdout.write('{:<20}\033[0m {}'.format(str(data)[2:-1], dsc))
+	sys.stdout.write('\033[0m')
+	
+	
+	if p['incomplete']:
+		sys.stdout.write('\033[1;33m  ! incomplete !')
+	
+	sys.stdout.write('\n')
